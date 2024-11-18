@@ -1,131 +1,123 @@
-from dataclasses import dataclass
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from database import ApartmentDB
+import traceback
 from datetime import datetime
-import folium
-from typing import Dict, List
-import sqlite3
-import requests
-from flask import Flask, render_template, jsonify, request
-from geopy.geocoders import Nominatim
-from geopy.distance import geodesic
-
-@dataclass
-class Apartment:
-    id: int
-    name: str
-    address: str
-    latitude: float
-    longitude: float
-    contact_info: str
-    lowest_price: float
-    times_contacted: int
-    last_updated: datetime
-    phone_number: str
-    notes: str
-    is_tracked: bool = False
-
-class ApartmentTracker:
-    def __init__(self, db_path="apartments.db"):
-        self.conn = sqlite3.connect(db_path)
-        self.setup_database()
-        self.geolocator = Nominatim(user_agent="apartment_tracker")
-        
-    def setup_database(self):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS apartments (
-                id INTEGER PRIMARY KEY,
-                name TEXT,
-                address TEXT,
-                latitude REAL,
-                longitude REAL,
-                contact_info TEXT,
-                lowest_price REAL,
-                times_contacted INTEGER,
-                last_updated TIMESTAMP,
-                phone_number TEXT,
-                notes TEXT,
-                is_tracked BOOLEAN
-            )
-        """)
-        self.conn.commit()
-
-    def add_apartment(self, apartment: Apartment):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO apartments 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            apartment.id, apartment.name, apartment.address,
-            apartment.latitude, apartment.longitude, apartment.contact_info,
-            apartment.lowest_price, apartment.times_contacted,
-            apartment.last_updated, apartment.phone_number,
-            apartment.notes, apartment.is_tracked
-        ))
-        self.conn.commit()
-
-    def get_apartments_in_radius(self, center_lat: float, center_lon: float, radius_km: float) -> List[Apartment]:
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM apartments")
-        apartments = []
-        
-        for row in cursor.fetchall():
-            apt = Apartment(*row)
-            distance = geodesic(
-                (center_lat, center_lon),
-                (apt.latitude, apt.longitude)
-            ).kilometers
-            
-            if distance <= radius_km:
-                apartments.append(apt)
-                
-        return apartments
-
-    def calculate_commute(self, start_lat: float, start_lon: float, 
-                         end_lat: float, end_lon: float) -> Dict:
-        # Using OpenStreetMap Routing Machine API (OSRM)
-        url = f"http://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
-        response = requests.get(url)
-        data = response.json()
-        
-        if data["code"] == "Ok":
-            route = data["routes"][0]
-            return {
-                "distance_km": route["distance"] / 1000,
-                "duration_minutes": route["duration"] / 60
-            }
-        return None
 
 app = Flask(__name__)
-tracker = ApartmentTracker()
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:3000", "http://localhost:3001"],
+        "methods": ["GET", "POST", "OPTIONS"]
+    }
+})
 
-@app.route('/map')
-def show_map():
-    center_lat = request.args.get('lat', 37.7749)  # Default to San Francisco
-    center_lon = request.args.get('lon', -122.4194)
-    radius = request.args.get('radius', 5)
-    
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=13)
-    
-    apartments = tracker.get_apartments_in_radius(center_lat, center_lon, radius)
-    
-    for apt in apartments:
-        popup_html = f"""
-            <b>{apt.name}</b><br>
-            Address: {apt.address}<br>
-            Price: ${apt.lowest_price:,.2f}<br>
-            Phone: {apt.phone_number}<br>
-            <button onclick="toggleTracking({apt.id})">
-                {'Remove from' if apt.is_tracked else 'Add to'} Tracker
-            </button>
-        """
-        
-        folium.Marker(
-            [apt.latitude, apt.longitude],
-            popup=popup_html,
-            icon=folium.Icon(color='red' if apt.is_tracked else 'blue')
-        ).add_to(m)
-    
-    return m._repr_html_()
+db = ApartmentDB()
+
+@app.route('/api/apartments/search', methods=['POST'])
+def search_apartments():
+    try:
+        data = request.json
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM apartments")
+            apartments = []
+            search_lat = float(data['lat'])
+            search_lon = float(data['lon'])
+            radius = float(data.get('radius', 5))
+            
+            for row in cursor.fetchall():
+                apt = {
+                    'id': row[0],
+                    'name': row[1],
+                    'address': row[2],
+                    'latitude': row[3],
+                    'longitude': row[4],
+                    'contact_info': row[5],
+                    'lowestPrice': row[6],
+                    'timesContacted': row[7],
+                    'lastUpdated': row[8],
+                    'phone_number': row[9],
+                    'notes': row[10],
+                    'rating': row[11],
+                    'is_tracked': bool(row[12]) if row[12] is not None else False
+                }
+                apartments.append(apt)
+            
+            return jsonify(apartments)
+    except Exception as e:
+        print(f"Error in search_apartments: {traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/apartments', methods=['POST'])
+def add_apartment():
+    try:
+        data = request.json
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO apartments (
+                    name, address, latitude, longitude, contact_info,
+                    lowest_price, times_contacted, last_updated,
+                    phone_number, notes, rating, is_tracked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                data['name'],
+                data['address'],
+                data['latitude'],
+                data['longitude'],
+                data['contact_info'],
+                data['lowest_price'],
+                0,  # times_contacted starts at 0
+                datetime.now(),
+                data['phone_number'],
+                data.get('notes', ''),
+                data.get('rating', 0),
+                False  # is_tracked starts as False
+            ))
+            conn.commit()
+            return jsonify({'id': cursor.lastrowid}), 201
+    except Exception as e:
+        print(f"Error in add_apartment: {traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/apartments/<int:apartment_id>', methods=['PUT'])
+def update_apartment(apartment_id):
+    try:
+        data = request.json
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE apartments SET
+                    name = ?,
+                    address = ?,
+                    latitude = ?,
+                    longitude = ?,
+                    contact_info = ?,
+                    lowest_price = ?,
+                    phone_number = ?,
+                    notes = ?,
+                    rating = ?,
+                    is_tracked = ?
+                WHERE id = ?
+            """, (
+                data['name'],
+                data['address'],
+                data['latitude'],
+                data['longitude'],
+                data['contact_info'],
+                data['lowest_price'],
+                data['phone_number'],
+                data.get('notes', ''),
+                data.get('rating', 0),
+                data.get('is_tracked', False),
+                apartment_id
+            ))
+            conn.commit()
+            return jsonify({'success': True})
+    except Exception as e:
+        print(f"Error in update_apartment: {traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)

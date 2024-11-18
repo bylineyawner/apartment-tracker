@@ -1,6 +1,7 @@
 # backend/src/models/apartment.py
 from dataclasses import dataclass
 from datetime import datetime
+from math import cos, asin, sqrt
 
 @dataclass
 class Apartment:
@@ -18,76 +19,91 @@ class Apartment:
     rating: int = 0
     is_tracked: bool = False
 
+    @staticmethod
+    def distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        p = 0.017453292519943295
+        hav = 0.5 - cos((lat2-lat1)*p)/2 + cos(lat1*p)*cos(lat2*p) * (1-cos((lon2-lon1)*p))/2
+        return 12742 * asin(sqrt(hav))  # 2*R*asin... R = 6371 km
+
 # backend/src/database.py
 import sqlite3
 from contextlib import contextmanager
 from .models.apartment import Apartment
 
-DATABASE_NAME = "apartments.db"
+class ApartmentDB:
+    def __init__(self, db_path="apartments.db"):
+        self.db_path = db_path
+        self.init_db()
 
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DATABASE_NAME)
-    try:
-        yield conn
-    finally:
-        conn.commit()
-        conn.close()
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
-def init_db():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS apartments (
-                id INTEGER PRIMARY KEY,
-                name TEXT,
-                address TEXT,
-                latitude REAL,
-                longitude REAL,
-                contact_info TEXT,
-                lowest_price REAL,
-                times_contacted INTEGER,
-                last_updated TIMESTAMP,
-                phone_number TEXT,
-                notes TEXT,
-                is_tracked BOOLEAN,
-                rating INTEGER DEFAULT 0
-            )
-        """)
+    def init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS apartments (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    contact_info TEXT,
+                    lowest_price REAL,
+                    times_contacted INTEGER DEFAULT 0,
+                    last_updated TIMESTAMP,
+                    phone_number TEXT,
+                    notes TEXT,
+                    rating INTEGER DEFAULT 0,
+                    is_tracked BOOLEAN DEFAULT FALSE
+                )
+            """)
+
+    def find_apartments_in_radius(self, lat: float, lon: float, radius_km: float = 5) -> list[Apartment]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            # Get all apartments - filtering by distance will be done in Python
+            cursor.execute("SELECT * FROM apartments")
+            apartments = []
+            
+            for row in cursor.fetchall():
+                apt = Apartment(*row)
+                distance = Apartment.distance(lat, lon, apt.latitude, apt.longitude)
+                if distance <= radius_km:
+                    apartments.append(apt)
+            
+            return apartments
 
 # backend/src/app.py
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import folium
-from geopy.geocoders import Nominatim
-from geopy.distance import geodesic
-import requests
-from .database import get_db, init_db
-from .models.apartment import Apartment
+from .database import ApartmentDB
 
 app = Flask(__name__)
 CORS(app)
+db = ApartmentDB()
 
-@app.route('/apartments', methods=['GET'])
-def get_apartments():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM apartments")
-        apartments = [Apartment(*row) for row in cursor.fetchall()]
-        return jsonify([vars(apt) for apt in apartments])
-
-@app.route('/update_rating', methods=['POST'])
-def update_rating():
+@app.route('/api/apartments/search', methods=['POST'])
+def search_apartments():
     data = request.json
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE apartments 
-            SET rating = ? 
-            WHERE id = ?
-        """, (data['rating'], data['id']))
-        return jsonify({"success": True})
-
-if __name__ == '__main__':
-    init_db()
-    app.run(debug=True)
+    apartments = db.find_apartments_in_radius(
+        float(data['lat']), 
+        float(data['lon']), 
+        float(data.get('radius', 5))
+    )
+    return jsonify([{
+        'id': apt.id,
+        'name': apt.name,
+        'address': apt.address,
+        'latitude': apt.latitude,
+        'longitude': apt.longitude,
+        'lowestPrice': apt.lowest_price,
+        'contact_info': apt.contact_info,
+        'phone_number': apt.phone_number,
+        'rating': apt.rating
+    } for apt in apartments])
